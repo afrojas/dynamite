@@ -1,0 +1,24 @@
+development:
+  access_key: some_access_key
+  secret_key: some_secret_key
+  dynamo_db:
+    endpoint: http://localhost
+    port: 4000
+staging:
+  access_key: some_access_key
+  secret_key: some_secret_key
+  dynamo_db:
+    endpoint: http://localhost
+    port: 4000
+production:
+  access_key: some_access_key
+  secret_key: some_secret_key
+  dynamo_db:
+    endpoint: http://dynamodb.us-west-2.amazonaws.com
+    port: 80
+test:
+  access_key: some_access_key
+  secret_key: some_secret_key
+  dynamo_db:
+    endpoint: http://localhost
+    port: 4000
