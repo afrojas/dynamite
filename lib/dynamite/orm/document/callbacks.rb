@@ -29,7 +29,7 @@ module Dynamite
         end
         self.superclass.callbacks_for(type).each do |callback|
           object.send(callback)
-        end if self.superclass.method_defined?(:callbacks_for)
+        end if self.superclass.respond_to?(:callbacks_for)
       end
 
       def after_find(method)
