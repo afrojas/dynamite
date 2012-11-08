@@ -277,6 +277,20 @@ module Dynamite
         self.connection.delete_item(self, id.primary, id.range)
       end
 
+      def retry_after_error?(error, type, options)
+        if error.is_a?(ThroughputException)
+          if options[:iteration].to_i <= ::Dynamite::DynamoDB::API::MAX_RETRIES
+            error.message =~ /Throughput error: (.+)/
+            # EmailLogger.log("Retrying due to throughput limits: #{$1}")
+            # sleep for > 1 second to let throughput limit reset, and then try again.
+            # TODO: eventually may want to change to non-email logging, or at least adjust sleep time.
+            EM::Synchrony.sleep(1)
+            return true
+          end
+        end
+        false
+      end
+
     end
   end
 end

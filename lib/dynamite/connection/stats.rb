@@ -9,8 +9,7 @@ module Dynamite
 
       def self.record_type(type, options = {})
         return if FORGETTABLE_TYPES.include?(type)
-        table_name = (options['TableName'] || options['RequestItems'].keys.first || "unknown").dup
-        table_name.gsub!("#{::Dynamite.config.environment.to_s.downcase}_", "")
+        table_name = options[:klass].to_s
 
         if WRITE_TYPES.include?(type)
           query_stats(table_name)[:writes] += 1

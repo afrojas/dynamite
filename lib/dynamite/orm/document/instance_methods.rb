@@ -81,7 +81,7 @@ module Dynamite
         end
         self.persisted = true
         self.version_number += 1
-        self.class.connection.put_item(table_name, self)
+        self.class.connection.put_item(self.class, self)
         # TODO - handle errors
         self.class.execute_callbacks_for(self, ::Dynamite::Document::Callbacks::AFTER_CREATE) if is_first_time
         self.class.execute_callbacks_for(self, ::Dynamite::Document::Callbacks::AFTER_SAVE)
