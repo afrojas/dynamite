@@ -22,8 +22,24 @@ module Dynamite
   class Configuration < Hashie::Mash
     attr_accessor :config_file_loaded
 
+    def public_environment?
+      production? || prerelease?
+    end
+    
+    def private_environment?
+      !public_environment
+    end
+    
     def development?
       environment == 'development'
+    end
+
+    def staging?
+      environment == 'staging'
+    end
+    
+    def prerelease?
+      environment == 'prerelease'
     end
 
     def production?

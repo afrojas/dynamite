@@ -41,5 +41,9 @@ module Dynamite
     def to_msgpack(arg)
       self.to_s.to_msgpack(arg)
     end
+    
+    def hash
+      self.to_s.hash
+    end
   end
 end

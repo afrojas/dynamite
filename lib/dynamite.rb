@@ -6,6 +6,7 @@ require 'eventmachine'
 require 'yaml'
 require 'erb'
 require 'oj'
+require 'yajl'
 require 'active_support/core_ext'
 require  'msgpack'
 

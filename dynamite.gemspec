@@ -19,7 +19,8 @@ Gem::Specification.new do |gem|
   gem.add_dependency('em-synchrony', '~> 1.0.1')
   gem.add_dependency('em-http-request', '~> 1.0.3')
   gem.add_dependency('nokogiri', '~> 1.5.2')
-  gem.add_dependency('oj', '~> 1.4.2')
+  gem.add_dependency('oj', '~> 2.0.0')
+  gem.add_dependency('yajl-ruby', '~> 1.1.0')
   gem.add_dependency('activesupport', '~> 3.2.3')
   gem.add_dependency('msgpack', '~> 0.4.6')
 end

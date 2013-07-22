@@ -4,17 +4,16 @@ module Dynamite
       include ::Dynamite::DynamoDB::RawRequest
       MAX_RETRIES = 3
 
-      def api_request(type, options)
-        dynamo_response = request(type, Oj.dump(options[:params]))
+      def api_request(type, options, iteration=1)
+        dynamo_response = request(type, Yajl.dump(options[:params]))
+        if dynamo_response.blank?
+          # Weird, try again 1 time.
+          dynamo_response = request(type, Yajl.dump(options[:params]))
+        end
         begin
-          response = Oj.load(dynamo_response)
-        rescue Oj::ParseError => error
-          if dynamo_response.blank?
-            # Weird, try again 1 time.  For convenience, just do request and parsing together.
-            response = Oj.load(request(type, Oj.dump(options[:params])))
-          else
-            raise BadJSONException.new("Bad JSON. Response: #{dynamo_response}.")
-          end
+          response = Yajl.load(dynamo_response)
+        rescue Yajl::ParseError => error
+          raise BadJSONException.new('Bad JSON.', {:response => dynamo_response})
         end
 
         begin
@@ -27,28 +26,20 @@ module Dynamite
           else
             raise exception
           end
+        ensure
+          Dynamite::DynamoDB::Stats.record_type(type, response, options)          
         end
-
-        Dynamite::DynamoDB::Stats.record_type(type, options)
-        # if Dynamite::DynamoDB.write_delay > 0
-        #   EM::Synchrony.sleep(Amazon::DynamoDB.write_delay)
-        # end
+        if Dynamite::DynamoDB.write_delay > 0
+          sleep Dynamite::DynamoDB.write_delay
+        end
         response
       end
 
-      # Deprecated, not being used.
-      # def list_tables(limit=10)
-      #   params = {
-      #     'Limit' => limit
-      #   }
-      #   api_request('ListTables', {:params => params})
-      # end
-
       def describe_table(klass)
         options = {'TableName' => klass.table_name}
-        # Go outside the standard flow, since we use this method to detect for the existance
-        # of tables.  That means errors such as ResourceNotFound are part of the standard operating flow.
-        Oj.load(request('DescribeTable', Oj.dump(options)))
+        # Don't throw a blanket exception, because we use this method to check for the existence
+        # of tables.  Can start using #api_request if we refactor #detect_errors
+        Yajl.load(request('DescribeTable', Yajl.dump(options)))
       end
 
       def create_table(klass)
@@ -61,8 +52,8 @@ module Dynamite
             }
           },
           'ProvisionedThroughput' => {
-            'ReadCapacityUnits' => 5,
-            'WriteCapacityUnits' => 10
+            'ReadCapacityUnits' => klass::DEFAULT_READ_THROUGHPUT,
+            'WriteCapacityUnits' => klass::DEFAULT_WRITE_THROUGHPUT
           }
         }
         if klass.range_options
@@ -89,7 +80,7 @@ module Dynamite
           'TableName' => klass.table_name,
           'Item' => fields
         }
-        # Version number will be 0 for newly initialized objects, but incremented by #save before
+        # Version number will be 0 for newly initialized objects, but incremented by #save before 
         # this method is called.
         if item.version_number > 1
           params['Expected'] = {'version_number' => {'Value' => {'N' => (item.version_number - 1).to_s}}}
@@ -151,9 +142,9 @@ module Dynamite
         params = {
           'RequestItems' => {
             klass.table_name => {
-              'Keys' => keys
+              'Keys' => keys.uniq # don't pass in duplicate keys, or dynamo will barf
             }
-          }
+          }        
         }
         response = api_request('BatchGetItem', {params: params, klass: klass, iteration: iteration})
         items = response['Responses'][klass.table_name]['Items']
@@ -177,7 +168,7 @@ module Dynamite
 
       def scan(klass, options)
         params = {
-          'TableName' => klass.table_name,
+          'TableName' => klass.table_name,          
         }
         limit = options.delete('limit')
         params['Limit'] = limit if limit
@@ -188,16 +179,36 @@ module Dynamite
             scan_filter[key] = {
               'AttributeValueList' => [{klass.data_type_code(key) => value.to_s}],
               'ComparisonOperator' => 'EQ'
-            }
+            } 
           end
           params['ScanFilter'] = scan_filter
         end
+        if block_given?
+          begin
+            response = api_request('Scan', {params: params, klass: klass})
+            yield response['Items']
+            params['ExclusiveStartKey'] = response['LastEvaluatedKey']
+          end until params['ExclusiveStartKey'].nil?
+        else
+          response = api_request('Scan', {params: params, klass: klass})
+          response['Items']
+        end
+      end
 
-        response = api_request('Scan', {params: params, klass: klass})
+      def query(klass, id, options)
+        params = {
+          'TableName' => klass.table_name,
+          'HashKeyValue' => {'S' => id},
+          'ScanIndexForward' => false
+        }
+        limit = options.delete('limit')
+        params['Limit'] = limit if limit
+        
+        response = api_request('Query', {params: params, klass: klass})
         response['Items']
       end
 
-      def paginate(klass, options = {})
+      def paginate(klass, params = {})
         params = {
           'TableName' => klass.table_name
         }
@@ -227,23 +238,24 @@ module Dynamite
           error_message = response['message'] || response['Message']  # Lame Amazon is not consistent
           if error_message =~ /The conditional request failed/
             expected = options[:params]['Expected']
-            log_message = "Options: #{options}"
+            log_message = "Table #{options[:klass]}."
             if expected.values.first['Exists'] == false
-              raise ItemAlreadyExistsException.new(log_message)
+              raise ItemAlreadyExistsException.new(log_message, {:options => options})
             elsif expected['version_number']
-              raise DirtyWriteException.new(log_message)
+              raise DirtyWriteException.new(log_message, {:options => options})
             else
-              raise BadExpectationsException.new(log_message)
+              raise BadExpectationsException.new(log_message, {:options => options})
             end
           elsif error_message =~ /configured provisioned throughput/
             operation = (type == 'PutItem') ? 'write' : 'read'
             raise ThroughputException.new("Throughput error: #{options[:klass]} needs more #{operation} throughput.")
+          elsif type == 'CreateTable' && error_message =~ /Table is being created/
+            # Race condition, the table we want is already being created.  No-op in this case
           else
-            raise DynamoException.new("#{error_message}\nOptions: #{options}.")
+            raise DynamoException.new(error_message, {:options => options})
           end
         end
       end
-
     end
   end
 end

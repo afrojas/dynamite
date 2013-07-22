@@ -29,6 +29,7 @@ module Dynamite
         headers["x-amzn-authorization"] =
           "AWS3 AWSAccessKeyId=#{access_key},Algorithm=HmacSHA256,SignedHeaders=#{headers_to_sign.join(';')},Signature=#{signature}"
 
+        Dynamite.log.info("DYNAMITE:: Request To Dynamo: #{command} #{payload}") if Dynamite.config.verbose_logging
         ::Dynamite.async do
           # Despite the Goliath example, we still need to wrap the http request in a synchrony block to achieve async behavior.
           http = EM::Synchrony.sync EventMachine::HttpRequest.new("#{host}:#{port}").apost(:head => headers, :body => payload)

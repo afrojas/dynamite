@@ -16,6 +16,7 @@ module Dynamite
         self.id = SecureRandom.uuid
         self.persisted = false
         self.version_number = 0
+        self.server_version = '1.0.0'
         self.created_at = Time.now
         options.each do |key, value|
           self.send("#{key}=", value)
@@ -44,6 +45,7 @@ module Dynamite
         clone.id = SecureRandom.uuid
         clone.persisted = false
         clone.version_number = 0
+        clone.server_version = '1.0.0'
         clone.save if persist
         clone
       end
@@ -81,7 +83,9 @@ module Dynamite
         end
         self.persisted = true
         self.version_number += 1
+        self.server_version = Dynamite.config.server_version
         self.class.connection.put_item(self.class, self)
+        invalidate_cache if self.class.cacheable && ::Dynamite.config.redis
         # TODO - handle errors
         self.class.execute_callbacks_for(self, ::Dynamite::Document::Callbacks::AFTER_CREATE) if is_first_time
         self.class.execute_callbacks_for(self, ::Dynamite::Document::Callbacks::AFTER_SAVE)
@@ -90,6 +94,7 @@ module Dynamite
       end
 
       def delete
+        invalidate_cache if self.class.cacheable && ::Dynamite.config.redis
         self.class.connection.delete_item(self.class, id, range_key)
       end
 
@@ -116,7 +121,16 @@ module Dynamite
       # Note that this does a consistent read, meaning it will be slower and more expensive than
       # regular reads.
       def reload
-        self.class.find(dynamo_key, true)
+        object = self.class.find(dynamo_key, true)
+        if object.nil?
+          # What the fuck, how can an existing object not be found on a consistent read?  
+          # Deleted by someone else maybe?
+          # Try one more time
+          EM::Synchrony.sleep(1.1)
+          Log.warn("Reloaded object was nil, trying to find #{self.class}:#{self.dynamo_key}.")
+          object = self.class.find(dynamo_key, true)
+        end
+        object
       end
 
       def refresh(field)
@@ -144,12 +158,12 @@ module Dynamite
         when :dynamo_keys
           # Has_many associations are stored as Arrays of DynamoKey objects.
           value = Base64.strict_encode64(::Dynamite::DynaPack.pack(value))
-          data_type_code = 'B' if ::Dynamite.config.production?
+          data_type_code = 'B' if ::Dynamite.config.public_environment?
         when :serialized
           # Marshal.dump will produce binary values that DynamoDB can't handle.
           # Use strict encoding to avoid newlines which cause problems (at least with Fake Dynamo)
           value = Base64.strict_encode64(Marshal.dump(value))
-          data_type_code = 'B' if ::Dynamite.config.production?
+          data_type_code = 'B' if ::Dynamite.config.public_environment?
         when :numbers
           # Must be a unique set of numbers.
           data_type_code = 'NS'

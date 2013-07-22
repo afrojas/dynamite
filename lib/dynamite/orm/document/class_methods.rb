@@ -18,14 +18,20 @@ module Dynamite
       end
 
       def table_name
-        "#{::Dynamite.config.environment}_#{@table || self.to_s.underscore.pluralize}"
+        prefix = Dynamite.config.table_prefix || Dynamite.config.environment
+        "#{prefix}_#{@table || self.to_s.underscore.pluralize}"
       end
 
       def exists?
         response = connection.describe_table(self)
-        (response['__type'] =~ /ResourceNotFoundException/).nil?
+        (response['__type'] =~ /ResourceNotFoundException/).nil? &&
+        response['Table']['TableStatus'] == 'ACTIVE'
       end
-
+      
+      def create_table
+        @connection.create_table(self) unless exists?
+      end
+      
       def mark_field_as_persistent(name, type)
         persistent_fields[name.to_sym] = type
       end
@@ -80,19 +86,18 @@ module Dynamite
         return nil if id.blank?
         id = ::Dynamite::DynamoKey.from(id) unless id.is_a?(::Dynamite::DynamoKey)
         if cacheable && !consistent && ::Dynamite.config.redis
-          serialized = ::Dynamite.config.redis.get(cache_key(id))
-          return Marshal.load(serialized) if serialized
+          serialized = ::Dynamite.config.redis.hget(instances_cache_key, cache_key(id))
+          if serialized
+            Dynamite.log.info("DYNAMITE:: Cache hit for #{self.to_s} #{id}") if Dynamite.config.verbose_logging
+            return Marshal.load(serialized)
+          end
         end
         object = from_dynamo(connection.get_item(self, id.primary, id.range, consistent))
-        if cacheable && ::Dynamite.config.redis
-          ::Dynamite.config.redis.set(cache_key(id), Marshal.dump(object))
+        if cacheable && ::Dynamite.config.redis && !object.nil?
+          Dynamite.log.info("DYNAMITE:: Cache set for #{self.to_s} #{id}") if Dynamite.config.verbose_logging
+          ::Dynamite.config.redis.hset(instances_cache_key, cache_key(id), Marshal.dump(object))
         end
         object
-      end
-
-      def raw_find(id, consistent=false)
-        id = ::Dynamite::DynamoKey.from(id) unless id.is_a?(::Dynamite::DynamoKey)
-        connection.get_item(self, id.primary, id.range, consistent)
       end
 
       def find_all(ids)
@@ -102,7 +107,32 @@ module Dynamite
           raise DynamoException.new("Cannot get more than 100 objects from a batch get.")
         end
 
-        connection.batch_get_item(self, ids).map{|hash| from_dynamo(hash)}
+        if cacheable
+          cache_ids = ids.map{|id| cache_key(id)}
+          values = ::Dynamite.config.redis.hmget(instances_cache_key, cache_ids) if ::Dynamite.config.redis
+          values = [] if values.nil?
+          uncached_ids = []
+          objects = []
+          values.each_with_index do |value, index|
+            if value.nil?
+              uncached_ids << ids[index]
+            else
+              objects << Marshal.load(value)
+            end
+          end
+          if !uncached_ids.blank?
+            values = connection.batch_get_item(self, uncached_ids).map{|hash| from_dynamo(hash)}
+            objects += values
+            if ::Dynamite.config.redis
+              values.each do |value|
+                ::Dynamite.config.redis.hset(instances_cache_key, cache_key(value.dynamo_key), Marshal.dump(value))
+              end
+            end
+          end
+          objects
+        else
+          connection.batch_get_item(self, ids).map{|hash| from_dynamo(hash)}
+        end
       end
 
       # Checks to make sure the id is contained within the collection, and then will go load the object.
@@ -117,17 +147,28 @@ module Dynamite
       end
 
       def all(opts = {})
-        if cacheable && ::Dynamite.config.redis
-          serialized = ::Dynamite.config.redis.get(class_cache_key)
-          return Marshal.load(serialized) if serialized
-        end
+        if block_given?
+          connection.scan(self, opts) do |results|
+            objects = results.map{|obj| from_dynamo(obj)}
+            yield objects
+          end
+        else
+          if cacheable && ::Dynamite.config.redis
+            serialized = ::Dynamite.config.redis.get(class_cache_key)
+            if serialized
+              Dynamite.log.info("DYNAMITE:: Cache hit for #{self.to_s}.all") if Dynamite.config.verbose_logging
+              return Marshal.load(serialized)
+            end
+          end
 
-        objects = connection.scan(self, opts)
-        objects.map! { |obj| from_dynamo(obj) }
-        if cacheable && ::Dynamite.config.redis
-          ::Dynamite.config.redis.set(class_cache_key, Marshal.dump(objects))
+          objects = connection.scan(self, opts)
+          objects.map! { |obj| from_dynamo(obj) }
+          if cacheable && ::Dynamite.config.redis
+            Dynamite.log.info("DYNAMITE:: Cache set for #{self.to_s}.all") if Dynamite.config.verbose_logging
+            ::Dynamite.config.redis.set(class_cache_key, Marshal.dump(objects))
+          end
+          objects
         end
-        objects
       end
 
       def paginate(opts = {})
@@ -147,6 +188,11 @@ module Dynamite
 
       def where(params)
         objects = connection.scan(self, params)
+        objects.map{|obj| from_dynamo(obj)}
+      end
+
+      def query(id, limit=10)
+        objects = connection.query(self, id, {'limit' => limit})
         objects.map{|obj| from_dynamo(obj)}
       end
 
@@ -170,18 +216,27 @@ module Dynamite
           obj = blank_object(:id => hash['id']['S'], :persisted => true, :klass => klass)
 
           # Now set (override) all values retrieved from Dynamo
+          klass = klass.nil? ? self : klass
           hash.each do |field, value_hash|
             data_type_code = value_hash.keys.first
-            value = decode_field(field, value_hash[data_type_code], data_type_code)
-            obj.send("#{field}=", value)
+            value = klass.decode_field(field, value_hash[data_type_code], data_type_code)
+            setter_method = "#{field}="
+            begin
+              obj.send(setter_method, value)
+            rescue NoMethodError => error
+              # Only ignore missing methods that match the exact field.
+              if error.message =~ /undefined method `#{setter_method}/
+                Dynamite.log.warn("#{obj.class} #{obj.id} has no method for field: #{field}.")
+              else
+                raise error
+              end
+            end
           end
 
           obj.class.execute_callbacks_for(obj, ::Dynamite::Document::Callbacks::AFTER_FIND)
           obj
         rescue Exception => ex
           # For now, log every exception
-          puts "Error loading from dynamo: #{ex.message}"
-          puts ex.backtrace.join("\n")
           ::Dynamite.log.error("Error loading from dynamo: #{ex.message}")
           ::Dynamite.log.error(ex.backtrace.join("\n"))
           nil
@@ -213,7 +268,7 @@ module Dynamite
         when :numbers
           code = 'NS'
         when :dynamo_keys, :serialized
-          code = ::Dynamite.config.production? ? 'B' : 'S'
+          code = ::Dynamite.config.public_environment? ? 'B' : 'S'
         end
         code
       end
@@ -229,7 +284,7 @@ module Dynamite
       end
 
       def range_options
-        @range_options
+        @range_options || (superclass.range_options if superclass.respond_to?(:range_options))
       end
 
       def range_key(symbol, type=:string)
@@ -251,6 +306,9 @@ module Dynamite
       def transaction(object, &block)
         retries = 3
         while retries > 0
+          # Sometimes the object isn't found (maybe deleted in the middle of the transaction). 
+          # In that case, break out of the transaction.
+          break if object.nil?
           result = yield object
           break unless result
           begin
@@ -281,7 +339,10 @@ module Dynamite
         if error.is_a?(ThroughputException)
           if options[:iteration].to_i <= ::Dynamite::DynamoDB::API::MAX_RETRIES
             error.message =~ /Throughput error: (.+)/
-            # EmailLogger.log("Retrying due to throughput limits: #{$1}")
+            ::Dynamite.log.warn("Retrying due to throughput limits: #{$1}")
+            if ::Dynamite.config.email_logger
+              ::Dynamite.config.email_logger.log("Retrying due to throughput limits: #{$1}\n\n#{error.backtrace.join("\n")}")
+            end
             # sleep for > 1 second to let throughput limit reset, and then try again.
             # TODO: eventually may want to change to non-email logging, or at least adjust sleep time.
             EM::Synchrony.sleep(1)

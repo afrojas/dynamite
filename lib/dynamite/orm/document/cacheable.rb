@@ -8,7 +8,7 @@ module Dynamite
 
       def invalidate_cache
         if ::Dynamite.config.redis
-          ::Dynamite.config.redis.del(self.class.cache_key(self.dynamo_key))
+          ::Dynamite.config.redis.hdel(self.class.instances_cache_key, self.class.cache_key(self.dynamo_key))
           ::Dynamite.config.redis.del(self.class.class_cache_key)
         end
       end
@@ -27,14 +27,14 @@ module Dynamite
           "#{self.to_s}:all"
         end
 
+        def instances_cache_key
+          "#{self.to_s}:instances"
+        end
+
         def invalidate_cache
-          if ::Dynamite.config.production?
-            ::Dynamite.log.warn("You can't run this on production, it might be too slow.")
-          else
-            if ::Dynamite.config.redis
-              keys = ::Dynamite.config.redis.keys("#{self.to_s}:*")
-              ::Dynamite.config.redis.del(keys) unless keys.blank?
-            end
+          if ::Dynamite.config.redis
+            ::Dynamite.config.redis.del(instances_cache_key)
+            ::Dynamite.config.redis.del(class_cache_key)
           end
         end
       end # End ClassMethods
